@@ -29,3 +29,10 @@ jobs:
         uses: golangci/golangci-lint-action@v6
         with:
           version: latest
+          # go.mod's `go` directive is forced ahead by transitive deps
+          # (testcontainers-go et al.), often past whatever Go version the
+          # latest golangci-lint release binary was itself built with -
+          # goinstall builds golangci-lint from source with the toolchain
+          # this job already has (see setup-go above), sidestepping that
+          # binary-vs-go.mod version mismatch entirely.
+          install-mode: goinstall
