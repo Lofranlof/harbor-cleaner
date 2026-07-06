@@ -7,9 +7,9 @@ package app
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"slices"
-	"strings"
 	"sync"
 	"time"
 
@@ -147,7 +147,9 @@ func (c *Cleaner) Preserve(ctx context.Context) error {
 }
 
 // Clean deletes (or, in dry-run mode, just GETs) every non-preserved artifact,
-// bounded by a worker-pool semaphore and retried on transient errors.
+// bounded by a fixed-size worker pool and retried on transient errors. Every
+// artifact is attempted independently - one failing to delete does not stop
+// the others - and every failure is collected, not just the first.
 func (c *Cleaner) Clean(ctx context.Context) error {
 	deleteFunc, err := c.deleteFuncFor(c.opts.DeleteMode)
 	if err != nil {
@@ -166,43 +168,59 @@ func (c *Cleaner) Clean(ctx context.Context) error {
 	}
 	log.Infof("Scheduling cleaning of %d artifacts...", len(toDelete))
 
-	semaphore := make(chan struct{}, c.opts.NumOfWorkersCleaning)
-	errCh := make(chan error, len(toDelete))
-	var wg sync.WaitGroup
-
-	for _, art := range toDelete {
-		art := art
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+	artifactsCh := make(chan *domain.Artifact)
+	go func() {
+		defer close(artifactsCh)
+		for _, art := range toDelete {
 			select {
-			case semaphore <- struct{}{}:
-				defer func() { <-semaphore }()
+			case artifactsCh <- art:
 			case <-ctx.Done():
 				return
 			}
-			c.cleanOne(ctx, deleteFunc, art, errCh)
+		}
+	}()
+
+	errsCh := make(chan error)
+	var wg sync.WaitGroup
+	wg.Add(c.opts.NumOfWorkersCleaning)
+	for i := 0; i < c.opts.NumOfWorkersCleaning; i++ {
+		go func() {
+			defer wg.Done()
+			for art := range artifactsCh {
+				if cleanErr := c.cleanOne(ctx, deleteFunc, art); cleanErr != nil {
+					select {
+					case errsCh <- cleanErr:
+					case <-ctx.Done():
+						return
+					}
+				}
+			}
 		}()
 	}
+	go func() {
+		wg.Wait()
+		close(errsCh)
+	}()
 
-	wg.Wait()
-	close(errCh)
-	for err := range errCh {
-		if err != nil {
-			return fmt.Errorf("couldn't clean images due to error: %w", err)
-		}
+	var errs []error
+	for cleanErr := range errsCh {
+		errs = append(errs, cleanErr)
+	}
+
+	if len(errs) > 0 {
+		return fmt.Errorf("couldn't clean %d artifact(s): %w", len(errs), errors.Join(errs...))
 	}
 	return nil
 }
 
-func (c *Cleaner) cleanOne(ctx context.Context, deleteFunc func(context.Context, *domain.Artifact) error, art *domain.Artifact, errCh chan<- error) {
+func (c *Cleaner) cleanOne(ctx context.Context, deleteFunc func(context.Context, *domain.Artifact) error, art *domain.Artifact) error {
 	fullName := fmt.Sprintf("%s/%s@%s", c.opts.RegistryHost, art.Repo.Name, art.Digest)
 	err := retry.Do(
 		func() error { return deleteFunc(ctx, art) },
 		retry.RetryIf(func(err error) bool {
 			// Харбор мог отдать 504, при этом успев удалить артефакт - тогда
 			// последующие попытки будут получать 404/400, ретраить их бессмысленно.
-			return !strings.Contains(err.Error(), "404") && !strings.Contains(err.Error(), "400")
+			return !isAlreadyResolved(err)
 		}),
 		retry.Attempts(5),
 		retry.DelayType(retry.RandomDelay),
@@ -213,14 +231,23 @@ func (c *Cleaner) cleanOne(ctx context.Context, deleteFunc func(context.Context,
 	)
 	if err == nil {
 		log.Debugf("Cleaned artifact: %s", fullName)
-		return
+		return nil
 	}
-	if strings.Contains(err.Error(), "404") || strings.Contains(err.Error(), "400") {
+	if isAlreadyResolved(err) {
 		log.Warnf("Received error: %v when cleaning artifact: %s, continuing", err, fullName)
-		return
+		return nil
 	}
 	log.Errorf("Couldn't clean artifact %s due to error: %v", fullName, err)
-	errCh <- err
+	return err
+}
+
+// isAlreadyResolved reports whether err is an HTTP 404 or 400 response.
+// Checked via IsCode, which every per-endpoint error type the Harbor SDK
+// generates implements - not by matching the error text, which breaks
+// silently if the SDK's message format ever changes.
+func isAlreadyResolved(err error) bool {
+	var sc interface{ IsCode(code int) bool }
+	return errors.As(err, &sc) && (sc.IsCode(404) || sc.IsCode(400))
 }
 
 func (c *Cleaner) deleteFuncFor(mode string) (func(ctx context.Context, art *domain.Artifact) error, error) {

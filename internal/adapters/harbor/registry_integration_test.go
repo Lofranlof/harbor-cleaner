@@ -15,6 +15,7 @@ import (
 	"archive/tar"
 	"compress/gzip"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -28,7 +29,11 @@ import (
 	"time"
 
 	harboradapter "harbor-cleaner/internal/adapters/harbor"
+	"harbor-cleaner/internal/domain"
 
+	"github.com/goharbor/go-client/pkg/sdk/v2.0/client/project"
+	sdkmodels "github.com/goharbor/go-client/pkg/sdk/v2.0/models"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/testcontainers/testcontainers-go/modules/compose"
 )
@@ -67,7 +72,13 @@ func TestHarborRegistryAgainstRealHarbor(t *testing.T) {
 	baseURL := fmt.Sprintf("http://localhost:%d", httpPort)
 	waitForPing(t, baseURL, 3*time.Minute)
 
-	imageRef := pushTestImage(t, httpPort)
+	// imageRef is used by the fake-delete/delete/verify-gone/double-delete
+	// flow; moveImageRef is kept separate so the MoveArtifact subtest doesn't
+	// disturb the artifact the delete subtests depend on.
+	const repoName = "harbor-cleaner-integration-test"
+	const moveRepoName = "harbor-cleaner-integration-test-move"
+	imageRef := pushTestImage(t, httpPort, repoName)
+	moveImageRef := pushTestImage(t, httpPort, moveRepoName)
 
 	registryURL, err := url.Parse(baseURL + "/api/v2.0")
 	require.NoError(t, err)
@@ -88,21 +99,98 @@ func TestHarborRegistryAgainstRealHarbor(t *testing.T) {
 	projects, err := registry.ListProjects(ctx, []string{"library"})
 	require.NoError(t, err)
 	require.Len(t, projects, 1, "expected the seeded \"library\" project")
-	require.Len(t, projects[0].Repos, 1, "expected the repo we just pushed: %s", imageRef)
-	repo := projects[0].Repos[0]
+	require.Len(t, projects[0].Repos, 2, "expected the two repos we just pushed: %s, %s", imageRef, moveImageRef)
+
+	var repo, moveRepo *domain.Repository
+	for _, r := range projects[0].Repos {
+		switch r.NameWithinProject {
+		case repoName:
+			repo = r
+		case moveRepoName:
+			moveRepo = r
+		}
+	}
+	require.NotNil(t, repo, "repo for %s", imageRef)
+	require.NotNil(t, moveRepo, "repo for %s", moveImageRef)
 	require.Len(t, repo.Artifacts, 1)
+	require.Len(t, moveRepo.Artifacts, 1)
 	digest := repo.Artifacts[0].Digest
+	moveDigest := moveRepo.Artifacts[0].Digest
 
-	require.NoError(t, registry.FakeDeleteArtifact(ctx, "library", repo.NameWithinProject, digest))
+	t.Run("ListAllProjects also finds the seeded project", func(t *testing.T) {
+		allProjects, err := registry.ListAllProjects(ctx)
+		require.NoError(t, err)
 
-	require.NoError(t, registry.DeleteArtifact(ctx, "library", repo.NameWithinProject, digest))
+		var library *domain.Project
+		for _, p := range allProjects {
+			if p.Name == "library" {
+				library = p
+			}
+		}
+		require.NotNil(t, library, "ListAllProjects should include the seeded \"library\" project")
+		assert.Len(t, library.Repos, 2)
+	})
 
-	projectsAfterDelete, err := registry.ListProjects(ctx, []string{"library"})
-	require.NoError(t, err)
-	// Harbor keeps the (now empty) repository entry around after its last
-	// artifact is deleted - only the artifact itself is guaranteed gone.
-	require.Len(t, projectsAfterDelete[0].Repos, 1)
-	require.Empty(t, projectsAfterDelete[0].Repos[0].Artifacts, "artifact should be gone after DeleteArtifact")
+	t.Run("MoveArtifact copies into another project and removes it from the source", func(t *testing.T) {
+		_, err := client.Project.CreateProject(ctx, &project.CreateProjectParams{
+			Project: &sdkmodels.ProjectReq{ProjectName: "trashcan"},
+		})
+		require.NoError(t, err)
+
+		require.NoError(t, registry.MoveArtifact(ctx, "library", "trashcan", moveRepo.NameWithinProject, moveDigest))
+
+		trashcanProjects, err := registry.ListProjects(ctx, []string{"trashcan"})
+		require.NoError(t, err)
+		require.Len(t, trashcanProjects[0].Repos, 1)
+		require.Len(t, trashcanProjects[0].Repos[0].Artifacts, 1)
+		assert.Equal(t, moveDigest, trashcanProjects[0].Repos[0].Artifacts[0].Digest)
+
+		libraryProjects, err := registry.ListProjects(ctx, []string{"library"})
+		require.NoError(t, err)
+		for _, r := range libraryProjects[0].Repos {
+			if r.NameWithinProject == moveRepo.NameWithinProject {
+				assert.Empty(t, r.Artifacts, "artifact should be gone from library after MoveArtifact")
+			}
+		}
+	})
+
+	t.Run("FakeDeleteArtifact is read-only", func(t *testing.T) {
+		require.NoError(t, registry.FakeDeleteArtifact(ctx, "library", repo.NameWithinProject, digest))
+
+		projectsAfterFakeDelete, err := registry.ListProjects(ctx, []string{"library"})
+		require.NoError(t, err)
+		for _, r := range projectsAfterFakeDelete[0].Repos {
+			if r.NameWithinProject == repo.NameWithinProject {
+				assert.Len(t, r.Artifacts, 1, "FakeDeleteArtifact must not actually delete anything")
+			}
+		}
+	})
+
+	t.Run("DeleteArtifact removes the artifact", func(t *testing.T) {
+		require.NoError(t, registry.DeleteArtifact(ctx, "library", repo.NameWithinProject, digest))
+
+		projectsAfterDelete, err := registry.ListProjects(ctx, []string{"library"})
+		require.NoError(t, err)
+		// Harbor keeps the (now empty) repository entry around after its last
+		// artifact is deleted - only the artifact itself is guaranteed gone.
+		for _, r := range projectsAfterDelete[0].Repos {
+			if r.NameWithinProject == repo.NameWithinProject {
+				assert.Empty(t, r.Artifacts, "artifact should be gone after DeleteArtifact")
+			}
+		}
+	})
+
+	t.Run("deleting an already-deleted artifact returns a typed 404, not a string to grep", func(t *testing.T) {
+		err := registry.DeleteArtifact(ctx, "library", repo.NameWithinProject, digest)
+		require.Error(t, err)
+
+		// This is what internal/app.isAlreadyResolved relies on to tell a
+		// harmless "already gone" 404 apart from a real failure, without
+		// string-matching the error text.
+		var statusCoder interface{ IsCode(code int) bool }
+		require.True(t, errors.As(err, &statusCoder), "expected err to carry an IsCode(int) bool method, got: %T", err)
+		assert.True(t, statusCoder.IsCode(404))
+	})
 }
 
 func freeTCPPort(t *testing.T) int {
@@ -253,11 +341,12 @@ func waitForPing(t *testing.T, baseURL string, timeout time.Duration) {
 }
 
 // pushTestImage pulls a tiny public image and pushes it into Harbor's
-// "library" project, so the registry has a real artifact to list and delete.
-func pushTestImage(t *testing.T, httpPort int) string {
+// "library" project under repoName, so the registry has a real artifact to
+// list and delete.
+func pushTestImage(t *testing.T, httpPort int, repoName string) string {
 	t.Helper()
 	registryHost := fmt.Sprintf("localhost:%d", httpPort)
-	imageRef := fmt.Sprintf("%s/library/harbor-cleaner-integration-test:latest", registryHost)
+	imageRef := fmt.Sprintf("%s/library/%s:latest", registryHost, repoName)
 
 	run := func(name string, args ...string) {
 		cmd := exec.Command(name, args...)

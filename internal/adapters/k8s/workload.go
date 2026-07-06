@@ -2,10 +2,10 @@ package k8s
 
 import (
 	"context"
-	"sync"
 	"time"
 
 	"harbor-cleaner/internal/ports"
+	"harbor-cleaner/utils"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -37,33 +37,14 @@ func (w *WorkloadSource) LiveImageRefs(ctx context.Context) (map[string]struct{}
 	ctxWithTimeout, cancel := context.WithTimeout(ctx, w.timeout)
 	defer cancel()
 
-	type result struct {
-		images map[string]struct{}
-		err    error
+	perCluster, err := utils.Gather(ctxWithTimeout, w.clientsets, imagesFromCluster)
+	if err != nil {
+		return nil, err
 	}
-	resultsCh := make(chan result, len(w.clientsets))
-	var wg sync.WaitGroup
-
-	for _, clientset := range w.clientsets {
-		clientset := clientset
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			images, err := imagesFromCluster(ctxWithTimeout, clientset)
-			resultsCh <- result{images: images, err: err}
-		}()
-	}
-	go func() {
-		wg.Wait()
-		close(resultsCh)
-	}()
 
 	merged := make(map[string]struct{})
-	for res := range resultsCh {
-		if res.err != nil {
-			return nil, res.err
-		}
-		for image := range res.images {
+	for _, images := range perCluster {
+		for image := range images {
 			merged[image] = struct{}{}
 		}
 	}

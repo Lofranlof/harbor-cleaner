@@ -3,7 +3,6 @@ package vault
 import (
 	"context"
 	"fmt"
-	"sync"
 	"time"
 
 	"harbor-cleaner/internal/ports"
@@ -60,38 +59,26 @@ func (p *SecretsProvider) HarborCredentials(ctx context.Context) (ports.HarborCr
 func (p *SecretsProvider) Kubeconfigs(ctx context.Context, clusterNames []string) (map[string]string, error) {
 	engine, basePath := utils.ParseVaultPath(p.cfg.KubeconfigsPath)
 
-	type result struct {
-		cluster string
-		secret  *vaultapi.KVSecret
-		err     error
+	fetch := func(ctx context.Context, cluster string) (string, error) {
+		secret, err := readSecret(ctx, p.client, p.cfg.Timeout, engine, fmt.Sprintf("%s/%s", basePath, cluster))
+		if err != nil {
+			return "", fmt.Errorf("couldn't read kubeconfig for cluster %s from Vault: %w", cluster, err)
+		}
+		kubeconfig, ok := secret.Data[p.cfg.KubeconfigKey].(string)
+		if !ok {
+			return "", fmt.Errorf("kubeconfig secret for cluster %s has no string field %q", cluster, p.cfg.KubeconfigKey)
+		}
+		return kubeconfig, nil
 	}
 
-	resultsCh := make(chan result, len(clusterNames))
-	var wg sync.WaitGroup
-	for _, cluster := range clusterNames {
-		cluster := cluster
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			secret, err := readSecret(ctx, p.client, p.cfg.Timeout, engine, fmt.Sprintf("%s/%s", basePath, cluster))
-			resultsCh <- result{cluster: cluster, secret: secret, err: err}
-		}()
+	results, err := utils.Gather(ctx, clusterNames, fetch)
+	if err != nil {
+		return nil, err
 	}
-	go func() {
-		wg.Wait()
-		close(resultsCh)
-	}()
 
 	kubeconfigs := make(map[string]string, len(clusterNames))
-	for res := range resultsCh {
-		if res.err != nil {
-			return nil, fmt.Errorf("couldn't read kubeconfig for cluster %s from Vault: %w", res.cluster, res.err)
-		}
-		kubeconfig, ok := res.secret.Data[p.cfg.KubeconfigKey].(string)
-		if !ok {
-			return nil, fmt.Errorf("kubeconfig secret for cluster %s has no string field %q", res.cluster, p.cfg.KubeconfigKey)
-		}
-		kubeconfigs[res.cluster] = kubeconfig
+	for i, cluster := range clusterNames {
+		kubeconfigs[cluster] = results[i]
 	}
 	return kubeconfigs, nil
 }

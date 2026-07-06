@@ -2,9 +2,9 @@ package harbor
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/url"
-	"sync"
 	"time"
 
 	"harbor-cleaner/internal/domain"
@@ -251,37 +251,22 @@ func (r *Registry) listArtifactsInRepoConc(ctx context.Context, projectName, rep
 // listArtifactsAcrossRepos fans out one goroutine per repo (each of which itself
 // paginates concurrently via listArtifactsInRepoConc) and collects every artifact.
 func (r *Registry) listArtifactsAcrossRepos(ctx context.Context, repos []*sdkmodels.Repository, projectNameOf func(*sdkmodels.Repository) string) ([]*sdkmodels.Artifact, error) {
-	type response struct {
-		data []*sdkmodels.Artifact
-		errs []error
-	}
-	var wg sync.WaitGroup
-	chanResponses := make(chan *response, len(repos))
-
-	for _, repo := range repos {
-		repo := repo
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			data, errs := r.listArtifactsInRepoConc(ctx, projectNameOf(repo), utils.GetRepoNameWithinProject(repo.Name))
-			select {
-			case chanResponses <- &response{data: data, errs: errs}:
-			case <-ctx.Done():
-			}
-		}()
+	fetch := func(ctx context.Context, repo *sdkmodels.Repository) ([]*sdkmodels.Artifact, error) {
+		data, errs := r.listArtifactsInRepoConc(ctx, projectNameOf(repo), utils.GetRepoNameWithinProject(repo.Name))
+		if len(errs) > 0 {
+			return nil, fmt.Errorf("encountered errors while fetching artifacts: %w", errors.Join(errs...))
+		}
+		return data, nil
 	}
 
-	go func() {
-		wg.Wait()
-		close(chanResponses)
-	}()
+	perRepo, err := utils.Gather(ctx, repos, fetch)
+	if err != nil {
+		return nil, err
+	}
 
 	artifacts := make([]*sdkmodels.Artifact, 0)
-	for resp := range chanResponses {
-		if len(resp.errs) > 0 {
-			return nil, fmt.Errorf("encountered errors while fetching artifacts: %v", resp.errs)
-		}
-		artifacts = append(artifacts, resp.data...)
+	for _, data := range perRepo {
+		artifacts = append(artifacts, data...)
 	}
 	return artifacts, nil
 }
@@ -313,27 +298,36 @@ func (r *Registry) listArtifactsInProjectConc(ctx context.Context, projectName s
 // here - once assembled, the rest of the application only ever sees domain types.
 
 func assembleProjects(projs []*sdkmodels.Project, repos []*sdkmodels.Repository, artifacts []*sdkmodels.Artifact) []*domain.Project {
+	// Index repos by project and artifacts by repo up front, instead of
+	// rescanning the full repos/artifacts slices for every project/repo -
+	// at Harbor's documented scale (~3000 repos, ~65000 artifacts) a nested
+	// scan means ~R*A comparisons per full sync, this is O(P+R+A).
+	reposByProject := make(map[int64][]*sdkmodels.Repository, len(projs))
+	for _, repo := range repos {
+		reposByProject[repo.ProjectID] = append(reposByProject[repo.ProjectID], repo)
+	}
+	artifactsByRepo := make(map[int64][]*sdkmodels.Artifact, len(repos))
+	for _, art := range artifacts {
+		artifactsByRepo[art.RepositoryID] = append(artifactsByRepo[art.RepositoryID], art)
+	}
+
 	domainProjects := make([]*domain.Project, 0, len(projs))
 
 	for _, proj := range projs {
 		domainProject := &domain.Project{Name: proj.Name}
 
-		domainRepos := make([]*domain.Repository, 0, proj.RepoCount)
-		for _, repo := range repos {
-			if repo.ProjectID != int64(proj.ProjectID) {
-				continue
-			}
+		projRepos := reposByProject[int64(proj.ProjectID)]
+		domainRepos := make([]*domain.Repository, 0, len(projRepos))
+		for _, repo := range projRepos {
 			domainRepo := &domain.Repository{
 				Project:           domainProject,
 				Name:              repo.Name,
 				NameWithinProject: utils.GetRepoNameWithinProject(repo.Name),
 			}
 
-			domainArtifacts := make([]*domain.Artifact, 0, repo.ArtifactCount)
-			for _, art := range artifacts {
-				if art.RepositoryID != repo.ID {
-					continue
-				}
+			repoArtifacts := artifactsByRepo[repo.ID]
+			domainArtifacts := make([]*domain.Artifact, 0, len(repoArtifacts))
+			for _, art := range repoArtifacts {
 				domainArt := domain.NewArtifact(art.Digest, art.Size, time.Time(art.PushTime), tagsOf(art))
 				domainArt.Repo = domainRepo
 				domainArtifacts = append(domainArtifacts, domainArt)
