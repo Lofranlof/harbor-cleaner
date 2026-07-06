@@ -1,0 +1,55 @@
+# Example GitLab CI pipeline for running harbor-cleaner as a manually-triggered
+# or scheduled job. This is the original shape the tool was operated under in
+# production - kept here (sanitized of any company-specific values) as a
+# reference for wiring it into your own GitLab CI/CD.
+stages:
+  - clean
+
+variables:
+  LOG_LEVEL:
+    value: "info"
+    options: ["trace", "debug", "info", "warn", "error", "fatal", "panic"]
+    description: "Logging verbosity"
+  DELETE_MODE:
+    value: "dry-run"
+    options: ["dry-run", "soft-delete", "hard-delete"]
+    description: "dry-run only GETs artifacts, soft-delete moves them to the garbage project, hard-delete removes them for good"
+  PUSHED_DAYS_AGO:
+    value: "90"
+    description: "Artifacts younger than this many days are always kept"
+  TOP_AGE:
+    value: "3"
+    description: "The N freshest artifacts per repository are always kept"
+  WORKLOAD_SOURCE:
+    value: "none"
+    options: ["k8s", "none"]
+    description: "Whether to preserve images currently running in Kubernetes clusters"
+  PROJECTS_TO_CLEAN:
+    value: "all"
+    description: "Comma-separated Harbor projects to clean, or \"all\""
+  REPOS_TO_PRESERVE:
+    value: "none"
+    description: "Comma-separated repos (project/repo) to always keep"
+  CONFIG_NAME:
+    value: "example"
+    description: "Which configs/<name>.yml to load as the base config"
+
+manual-clean:
+  stage: clean
+  image: golang:1.23
+  id_tokens:
+    VAULT_ID_TOKEN:
+      aud: https://vault.example.com
+  script:
+    - go run ./cmd/harbor-cleaner
+      --config-name=$CONFIG_NAME
+      --projects-to-clean=$PROJECTS_TO_CLEAN
+      --repos-to-preserve=$REPOS_TO_PRESERVE
+      --log-level=$LOG_LEVEL
+      --pushed-days-ago=$PUSHED_DAYS_AGO
+      --top-age=$TOP_AGE
+      --workload-source=$WORKLOAD_SOURCE
+      --delete-mode=$DELETE_MODE
+      --vault-jwt=$VAULT_ID_TOKEN
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "web"

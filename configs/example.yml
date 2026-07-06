@@ -1,0 +1,95 @@
+# Example harbor-cleaner config. Copy this file, rename it, and point
+# --config-name at the new name (without .yml) - or just override individual
+# fields via CLI flags/env vars without creating a new file at all; every field
+# below has a matching --flag (see internal/config/config.go).
+
+# --- Harbor ---
+harbor-url-api: "https://harbor.example.com/api/v2.0"
+# Skip TLS verification - only for a local/demo Harbor with a self-signed cert.
+harbor-insecure-skip-verify: false
+
+# --- what to clean ---
+# Harbor projects to scan. Use "all" to scan the entire registry.
+projects-to-clean:
+  - "all"
+
+# Projects whose artifacts are never deleted, e.g. proxy-cache projects for
+# upstream registries you don't control.
+projects-to-preserve:
+  - "docker-hub-proxy"
+  - "gcr-io-proxy"
+  - "quay-io-proxy"
+
+# Full "<project>/<repo>" names whose artifacts are never deleted.
+repos-to-preserve:
+  - "none"
+
+# Artifacts pushed less than this many days ago are always kept (minimum 9).
+pushed-days-ago: 90
+
+# The N freshest artifacts in each repository are always kept.
+top-age: 3
+
+# --- deletion ---
+# dry-run: only GETs artifacts (safe, default). soft-delete: moves artifacts to
+# garbage-project-name. hard-delete: deletes artifacts for good.
+delete-mode: "dry-run"
+garbage-project-name: "trashcan"
+
+# --- secrets ---
+# Where to read the Harbor username/password from: "vault" or "env".
+secrets-provider: "vault"
+
+vault-url: "https://vault.example.com"
+# jwt: exchange a JWT (e.g. a CI job's OIDC token, see --vault-jwt) for a Vault
+# token via vault-auth-mount-path/vault-auth-role. token: read a static token
+# from the VAULT_TOKEN environment variable - handy for local runs.
+vault-auth-mode: "jwt"
+vault-auth-role: "harbor-cleaner"
+vault-auth-mount-path: "auth/jwt/login"
+
+# Vault KV path (engine included) and field names holding the Harbor
+# credentials. When secrets-provider is "env", these same two field names are
+# read as environment variable names instead.
+vault-harbor-creds-path-fullpath: "secret/harbor-cleaner"
+vault-harbor-login-secret-name: "HARBOR_REGISTRY_USER_RO"
+vault-harbor-password-secret-name: "HARBOR_REGISTRY_PASSWORD_RO"
+
+# Vault KV path (engine included) under which one kubeconfig secret per
+# cluster name is stored. Only used when workload-source is "k8s" and
+# k8s-auth-mode is "vault".
+vault-kubeconfigs-fullpath: "secret/kubeconfigs"
+
+# --- workload source (what counts as "currently in use") ---
+# "k8s" preserves images referenced by Deployment/StatefulSet/DaemonSet/Job/
+# CronJob pod templates in the listed clusters. "none" disables this rule
+# entirely, relying only on age/top-N/allow-list.
+workload-source: "none"
+clusters:
+  - "dev-cluster"
+  - "staging-cluster"
+  - "prod-cluster"
+
+# How to obtain Kubernetes API access: "vault" (fetch kubeconfigs via
+# secrets-provider), "local-kubeconfig" (see k8s-local-kubeconfig-path), or
+# "in-cluster" (use the pod's own service account).
+k8s-auth-mode: "vault"
+k8s-local-kubeconfig-path: ""
+
+# --- logging ---
+log-level: "info"
+log-target: "stdout"
+log-path: "./harbor-cleaner.log"
+
+# --- performance / concurrency ---
+page-size: 100
+num-of-workers-all-projects: 1
+num-of-workers-all-repos: 30
+num-of-workers-project-repos: 3
+num-of-workers-repo-artifacts: 2
+num-of-workers-artifacts-cleaning: 10
+
+harbor-timeout-minutes: 30
+vault-timeout-minutes: 5
+k8s-timeout-minutes: 10
+cleaning-timeout-minutes: 60
